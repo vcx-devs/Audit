@@ -5,7 +5,7 @@ import { BIP32Factory } from 'bip32'; //https://www.npmjs.com/package/bip32
 import bs from 'bs58'; //https://www.npmjs.com/package/bs58
 import { Keypair } from '@solana/web3.js'; //https://www.npmjs.com/package/@solana/web3.js
 import { ethers } from 'ethers'; //https://www.npmjs.com/package/ethers
-import { HDKey } from 'micro-ed25519-hdkey'; //https://www.npmjs.com/package/micro-ed25519-hdkey
+import slip10 from 'micro-key-producer/slip10.js'; //https://www.npmjs.com/package/micro-key-producer
 import AsyncStorage from '@react-native-async-storage/async-storage'; //https://www.npmjs.com/package/@react-native-async-storage/async-storage
 import { v4 as uuidv4 } from 'uuid'; //https://www.npmjs.com/package/uuid
 import * as Keychain from 'react-native-keychain'; //https://www.npmjs.com/package/react-native-keychain
@@ -14,28 +14,35 @@ import axios from 'axios'; //https://www.npmjs.com/package/axios
 
 //内部加密存储方法
 const setKeychainValue = async (key, value) => {
-    await Keychain.setGenericPassword(key, value, {
-        service: key,
-        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED,
-        storage: Keychain.STORAGE_TYPE.AES_GCM_NO_AUTH,
-        accessControl: Keychain.ACCESS_CONTROL.ALWAYS,
-    });
+    try {
+        await Keychain.setGenericPassword(key, value, {
+            service: key,
+            accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE,
+        });
+    } catch (error) {
+        throw new Error(`加密存储错误： ${error.message}`);
+    }
 }
 
 const removeKeychainValue = async (key) => {
-    await Keychain.resetGenericPassword({
-        service: key,
-    });
+    try {
+        await Keychain.resetGenericPassword({
+            service: key,
+        });
+    } catch (error) {
+        throw new Error(`移除加密错误： ${error.message}`);
+    }
 }
 
 const getKeychainValue = async (key) => {
-    const keychainValue = await Keychain.getGenericPassword({
-        service: key,
-        accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED, //数据在设备解锁时可访问。 如果设备被锁定，数据将不可用
-        storage: Keychain.STORAGE_TYPE.AES_GCM_NO_AUTH, //适用于应用级机密和缓存数据, 不需要生物特征认证
-        accessControl: Keychain.ACCESS_CONTROL.ALWAYS,
-    });
-    return keychainValue.password
+    try {
+        const keychainValue = await Keychain.getGenericPassword({
+            service: key,
+        });
+        return keychainValue.password
+    } catch (error) {
+        throw new Error(`获取加密错误： ${error.message}`);
+    }
 }
 
 
@@ -56,7 +63,7 @@ const generateAddresses = async (mnemonic, index) => {
 
         // 生成sol地址
         const solPath = "m/44'/501'/" + index + "'/0'"; // BIP44 路径
-        const hd = HDKey.fromMasterSeed(Buffer.from(seed));
+        const hd = slip10.fromMasterSeed(Buffer.from(seed));
         const keypair = Keypair.fromSeed(hd.derive(solPath).privateKey.slice(0, 32));
         const solPrivateKey = bs.encode(keypair.secretKey);
         const solAddress = keypair.publicKey.toBase58();
@@ -102,7 +109,7 @@ const generateAddresses = async (mnemonic, index) => {
             ]
         }
     } catch (error) {
-
+        throw new Error(`生成地址失败： ${error.message}`);
     }
 }
 
@@ -110,16 +117,20 @@ const generateAddresses = async (mnemonic, index) => {
 const createWalletByPrivateKey = async (privateKey, type) => {
 
     let addressServiceName;
+    let address; //问题d
     try {
 
         if (type === 'EVM') {
             const wallet = new ethers.Wallet(privateKey);
             addressServiceName = 'address_' + wallet.address + '_type_' + type;
+            address = wallet.address;
 
         } else if (type === 'Solana') {
             const keypair = Keypair.fromSecretKey(bs.decode(privateKey));
             const solAddress = keypair.publicKey.toBase58();
             addressServiceName = 'address_' + solAddress + '_type_' + type;
+            address = solAddress;
+
         }
 
         await setKeychainValue(addressServiceName, privateKey)
@@ -129,23 +140,34 @@ const createWalletByPrivateKey = async (privateKey, type) => {
             addressList: [
                 {
                     generateType: type,
-                    address: wallet.address,
+                    address: address,
                 },
             ]
 
         }
     } catch (error) {
-
+        throw new Error(`导入私钥失败： ${error.message}`);
     }
 
 }
 
+let isGetNextWalletId = true;
+//这里方式是同步执行 用户重复点击已经在业务逻辑层面处理完成，不会出现重复的id
 const getNextWalletId = async () => {
-
-    const id = await AsyncStorage.getItem('@walletId');
-    let walletId = +id + 1
-    await AsyncStorage.setItem('@walletId', walletId.toString());
-    return walletId;
+    try {
+        let walletId;
+        if (isGetNextWalletId) {
+            isGetNextWalletId = false;
+            const id = await AsyncStorage.getItem('@walletId');
+            walletId = +id + 1
+            await AsyncStorage.setItem('@walletId', walletId.toString());
+            isGetNextWalletId = true;
+        }
+        return walletId;
+    } catch (error) {
+        isGetNextWalletId = true;
+        throw new Error(`获取id失败： ${error.message}`);
+    }
 }
 
 //创建多链钱包
@@ -168,7 +190,7 @@ const createWallet = async () => {
         };
         return walletObject
     } catch (error) {
-        return null;
+        throw new Error(`创建多链钱包失败： ${error.message}`);
     }
 };
 
@@ -182,12 +204,15 @@ const deleteWallet = async (uuid) => {
 
         //遍历删除加密后的私钥
         for (let i = 0; i < wallets.length; i++) {
-            await removeKeychainValue('address_' + wallets[i].address + '_type_' + wallets[i].generateType)
+            if (wallets[i].uuid === uuid) { //根据问题E建议，删除与提供的uuid匹配的钱包的私钥
+                await removeKeychainValue('address_' + wallets[i].address + '_type_' + wallets[i].generateType)
+            }
         }
 
         return newWallets;
     } catch (error) {
-        return []
+        throw new Error(`删除钱包失败： ${error.message}`);
+
     }
 }
 
@@ -213,7 +238,7 @@ const importWalletByPrivateKey = async ({ privateKey, type }) => {
         return walletObject
 
     } catch (error) {
-        return null;
+        throw new Error(`导入私钥钱包失败： ${error.message}`);
     }
 };
 
@@ -237,7 +262,8 @@ const importWalletByMnemonic = async (mnemonic) => {
         return walletObject
 
     } catch (error) {
-        return null;
+
+        throw new Error(`通过助记词导入钱包失败： ${error.message}`);
     }
 };
 
@@ -254,46 +280,54 @@ const getKeychainPassword = async (serviceName) => {
         const keychainPassword = await getKeychainValue(serviceName)
         return keychainPassword;
     } catch (error) {
-        return null
+        throw new Error(`Keychain存储失败： ${error.message}`);
     }
 }
 
 
 //evm 签名
 const evmSign = async (wallet, tx) => {
-    const signTransactionParams = {
-        chainId: tx.chainId,
-        from: tx.from,
-        to: tx.to,
-        value: tx.value,
-        maxFeePerGas: tx.maxFeePerGas,
-        maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
-        gas: tx.gas,
-        nonce: tx.nonce,
-        data: tx.data,
-        type: 2 // 指定为 EIP-1559 交易
-    };
+    try {
+        const signTransactionParams = {
+            chainId: tx.chainId,
+            from: tx.from,
+            to: tx.to,
+            value: tx.value,
+            maxFeePerGas: tx.maxFeePerGas,
+            maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+            gas: tx.gas,
+            nonce: tx.nonce,
+            data: tx.data,
+            type: 2 // 指定为 EIP-1559 交易
+        };
 
-    const privateKey = await getKeychainPassword('address_' + wallet.address + '_type_' + wallet.type);
+        const privateKey = await getKeychainPassword('address_' + wallet.address + '_type_' + wallet.type);
 
-    const { rawTransaction } = await web3.eth.accounts.signTransaction(
-        signTransactionParams,
-        privateKey
-    );
-    return rawTransaction;
+        const { rawTransaction } = await web3.eth.accounts.signTransaction(
+            signTransactionParams,
+            privateKey
+        );
+        return rawTransaction;
+    } catch (error) {
+        throw new Error(`evm签名失败： ${error.message}`);
+    }
 }
 //sol 签名
 const solSign = async (wallet, swapTransaction) => {
 
-    const privateKey = await getKeychainPassword('address_' + wallet.address + '_type_' + wallet.type);
+    try {
+        const privateKey = await getKeychainPassword('address_' + wallet.address + '_type_' + wallet.type);
 
-    const wallet = solanaWeb3.Keypair.fromSecretKey(bs.decode(privateKey));
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-    var transaction = solanaWeb3.VersionedTransaction.deserialize(swapTransactionBuf);
-    transaction.sign([wallet]);
-    const rawTransaction = transaction.serialize();
-    const transactionVal = bs.encode(rawTransaction);
-    return transactionVal;
+        const wallet = solanaWeb3.Keypair.fromSecretKey(bs.decode(privateKey));
+        const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+        var transaction = solanaWeb3.VersionedTransaction.deserialize(swapTransactionBuf);
+        transaction.sign([wallet]);
+        const rawTransaction = transaction.serialize();
+        const transactionVal = bs.encode(rawTransaction);
+        return transactionVal;
+    } catch (error) {
+        throw new Error(`sol签名失败： ${error.message}`);
+    }
 }
 
 
@@ -326,7 +360,7 @@ const broadcast = async (data) => {
 //兑换
 const handleSwap = async () => {
     //第一步 获取兑换Data
-    const swapData =  await getSwapData({
+    const swapData = await getSwapData({
         chainId,
         fromTokenAddress,
         toTokenAddress,
@@ -347,10 +381,10 @@ const handleSwap = async () => {
         chainId: chainId,
         fromAddress: fromAddress,
         toAddress: toAddress,
-        contractAddress:contractAddress,
+        contractAddress: contractAddress,
         transactionData: broadcastData,
         type: 'Swap', //  Send  Swap  Approve
-        qty:qty,
+        qty: qty,
         walletId: walletId,
         memberId: memberId,
         swapFromAddress: swapFromAddress,
@@ -364,7 +398,7 @@ const handleSwap = async () => {
 //转账
 const handleWithdrawal = async () => {
     //第一步 获取转账Data
-    const withdrawalData =  await getWithdrawalData({
+    const withdrawalData = await getWithdrawalData({
         chainId,
         contractAddress,
         toAddress,
@@ -383,10 +417,10 @@ const handleWithdrawal = async () => {
     //第三步 广播交易
     const withdrawalBroadcastData = {
         chainId: chainId,
-        contractAddress:contractAddress,
+        contractAddress: contractAddress,
         fromAddress: fromAddress,
         toAddress: toAddress,
-        qty:qty,
+        qty: qty,
         transactionData: broadcastData,
         type: 'Send', //  Send  Swap  Approve
         walletId: walletId,
@@ -398,7 +432,7 @@ const handleWithdrawal = async () => {
 //授权
 const handleApprove = async () => {
     //第一步 获取兑换Data
-    const approveData =  await getApproveData({
+    const approveData = await getApproveData({
         chainId,
         fromTokenAddress,
         toTokenAddress,
